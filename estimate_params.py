@@ -34,6 +34,19 @@ def get_track_ids(seq):
     return list(track_ids)
 
 
+def calc_iou_matrix(objs, hyps, max_iou=1.):
+    if np.size(objs) == 0 or np.size(hyps) == 0:
+        return np.empty((0, 0))
+
+    objs = np.asarray(objs)
+    hyps = np.asarray(hyps)
+    assert objs.shape[1] == 4
+    assert hyps.shape[1] == 4
+    iou = mm.distances.boxiou(objs[:, None], hyps[None, :])
+    dist = 1 - iou
+    return np.where(dist > max_iou, np.nan, dist)
+
+
 def get_sequence_data(hw, img_size, seq, vo, iou_threshold, dtype, device):
     id_map = {id: i for i, id in enumerate(get_track_ids(seq))}
     num_frames = len(seq)
@@ -64,7 +77,7 @@ def get_sequence_data(hw, img_size, seq, vo, iou_threshold, dtype, device):
         tlwh_dets = to_numpy_ltwh(detections, hw=hw)
         scores = to_numpy_confidences(detections)
         tlwh_gt = to_numpy_ltwh(gt, hw=hw)
-        iou_matrix = mm.distances.iou_matrix(tlwh_gt, tlwh_dets)
+        iou_matrix = calc_iou_matrix(tlwh_gt, tlwh_dets)
 
         best_dets = iou_matrix.argmin(axis=1) if len(iou_matrix) > 0 else []
         best_tracks = iou_matrix.argmin(axis=0) if len(iou_matrix) > 0 else []
@@ -76,9 +89,12 @@ def get_sequence_data(hw, img_size, seq, vo, iou_threshold, dtype, device):
 
             track_idx = id_map[track.id]
             is_valid[frame_idx, track_idx] = True
+
             gt_data[frame_idx, track_idx, :] = torch.tensor(tlwh_gt[gt_idx])
             gt_data[frame_idx, track_idx, :2] += gt_data[frame_idx, track_idx, 2:] / 2
 
+            if len(best_dets) == 0:
+                continue
             det_idx = best_dets[gt_idx]
 
             if gt_idx == best_tracks[det_idx] and iou_matrix[gt_idx, det_idx] < iou_threshold:
@@ -89,10 +105,15 @@ def get_sequence_data(hw, img_size, seq, vo, iou_threshold, dtype, device):
 
         clutter_scores += np.atleast_1d(scores[clutter_dets]).tolist()
         det_scores += np.atleast_1d(scores).tolist()
-        clutter_sizes += np.atleast_1d(tlwh_dets[clutter_dets, 2]).tolist()
-        det_sizes += np.atleast_1d(tlwh_dets[:, 2]).tolist()
+        if len(clutter_dets) > 0:
+            clutter_sizes += np.atleast_1d(tlwh_dets[clutter_dets, 2]).tolist()
+        if len(tlwh_dets) > 0:
+            det_sizes += np.atleast_1d(tlwh_dets[:, 2]).tolist()
 
-        W[frame_idx] = torch.tensor(estimate_W(frame_id, vo, hw, in_size_hw=(h, w))[0])
+        if vo is None:
+            W[frame_idx] = torch.eye(3)
+        else:
+            W[frame_idx] = torch.tensor(estimate_W(frame_id, vo, hw, in_size_hw=(h, w))[0])
 
     return gt_data, meas_data, W, sigma_W, is_valid, is_detected, clutter_scores, det_scores, clutter_sizes, det_sizes
 
@@ -396,13 +417,16 @@ def read_sequence_data(reader, vo, target_hw, iou_threshold, dtype, device):
         dt = info['update_s']
 
         w, h = info['imWidth'], info['imHeight']
-        gt_data, meas_data, W, sigma_W, is_valid, is_detected, clutter_scores, det_scores, clutter_sizes, det_sizes = get_sequence_data(target_hw,
-                                                                                                             [h, w],
-                                                                                                             seq,
-                                                                                                             vo[name],
-                                                                                                             iou_threshold,
-                                                                                                             dtype,
-                                                                                                             device)
+        vo_s = vo[name] if ((vo is not None) and (name in vo)) else None
+
+        gt_data, meas_data, W, sigma_W, is_valid, is_detected, clutter_scores, det_scores, clutter_sizes, det_sizes = get_sequence_data(
+            target_hw,
+            [h, w],
+            seq,
+            vo_s,
+            iou_threshold,
+            dtype,
+            device)
         all_clutter_scores += clutter_scores
         all_det_scores += det_scores
         all_clutter_sizes += clutter_sizes
@@ -435,8 +459,9 @@ def generate_boxsize_hist(reader, hw, prefix=''):
 
     num_bins = 200
     h, bins, _ = plt.hist(boxsizes, density=True, log=True, bins=num_bins, range=(0, 1000))
-    hist = Hist1D(torch.tensor(h), torch.tensor(bins))
+    hist = torch.tensor(h), torch.tensor(bins)
     torch.save(hist, f'./data/{prefix}boxsize_hist.pt')
+
 
 def generate_inlier_odds_hist(clutter_scores, det_scores, clutter_sizes, det_sizes, prefix=''):
     num_bins = 30
@@ -449,7 +474,7 @@ def generate_inlier_odds_hist(clutter_scores, det_scores, clutter_sizes, det_siz
 
     detection_lr = (skimage.filters.gaussian(det_bins - clutter_bins, 2, mode='reflect')) / (
         skimage.filters.gaussian(clutter_bins, 2, mode='reflect'))
-    detection_lr_hist = Hist2D(torch.tensor(detection_lr), torch.tensor(score_edges), torch.tensor(size_edges))
+    detection_lr_hist = (torch.tensor(detection_lr), torch.tensor(score_edges), torch.tensor(size_edges))
     torch.save(detection_lr_hist, f"./data/{prefix}inlier_odds_hist.pt")
 
 
@@ -592,6 +617,62 @@ def estimate_parameters_mot20():
     print(f'wrote estimated params to {params_path}')
 
 
+def estimate_parameters_tmot(base_folder):
+    print('--------------------------')
+    print('Began estimation for TMOT')
+    dtype = torch.float64
+    device = torch.device('cpu')
+
+    hw = (1080, 1920)
+    # vo = read_vo('./data/MOT20/vo.json')
+    prefix = 'tmot_'
+
+    print('Loading data...')
+    reader = SequenceReader(
+        [
+            f'{base_folder}/train/seq*',
+            f'{base_folder}/valval/seq*'
+        ],
+        detections_filename='det_yolov8s_1280_mtmmc',
+    )
+    sequences, clutter_counts = read_sequence_data(reader, {}, hw, 0.3, dtype, device)
+
+    print('Estimating R...')
+    R = compute_R(sequences, dtype, device)
+    print(f'R:\n{R}')
+
+    print('Estimating Pcr...')
+    Pcr = compute_init_Pcr_coeff(sequences, dtype, device)
+    print(f'Pcr:\n{Pcr}')
+
+    print('Generating p_w histogram... ', end='')
+    generate_boxsize_hist(reader, hw, prefix)
+    print('done')
+
+    print('Generating P_C histgram... ', end='')
+    generate_inlier_odds_hist(*clutter_counts, prefix)
+    print('done')
+
+    print('Performing MLE for process noise parameters...')
+    sigma_ca, sigma_sr = estimate_process_noise(sequences, hw, Pcr, R)
+    print(f'sigma_ca: {sigma_ca:.2f}')
+    print(f'sigma_sr: {sigma_sr:.2f}')
+
+    params_path = f"./data/{prefix}estimated_params.pt"
+    torch.save(
+        dict(
+            Pcr=Pcr,
+            R=R,
+            sigma_ca=round(sigma_ca, 2),
+            sigma_sr=round(sigma_sr, 2)
+        ),
+        params_path
+    )
+    print(f'wrote estimated params to {params_path}')
+
+
 if __name__ == '__main__':
-    estimate_parameters_mot17()
-    estimate_parameters_mot20()
+    base_folder = '/home/sigmund/data/tracking/MOT/TMOT'
+    estimate_parameters_tmot(base_folder)
+    # estimate_parameters_mot17()
+    # estimate_parameters_mot20()

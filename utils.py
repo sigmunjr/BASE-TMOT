@@ -88,7 +88,7 @@ def write_results(filename, sequence_result):
 
 
 def get_hist_bin(lo_edges, lookup):
-    return (torch.searchsorted(lo_edges, lookup) - 1).clamp(0)
+    return (torch.searchsorted(lo_edges, lookup.contiguous()) - 1).clamp(0)
 
 
 class Hist1D:
@@ -97,7 +97,7 @@ class Hist1D:
         self.edges = edges[:-1]
 
     def __call__(self, lookup):
-        return self.hist[get_hist_bin(self.edges, lookup)]
+        return self.hist[get_hist_bin(self.edges, lookup.contiguous())]
 
 
 class Hist2D:
@@ -125,6 +125,8 @@ def estimate_W(frame_id, seq_ecc, detection_size_hw, in_size_hw):
     J_inv = np.diag([w / (dw * ecc_scale), h / (dh * ecc_scale), 1.])
     W = np.eye(3)
     warp_id = str(frame_id)
+    if seq_ecc is None:
+        return W, 0
 
     if warp_id in seq_ecc:
         W_str = seq_ecc[warp_id]  # , "1"

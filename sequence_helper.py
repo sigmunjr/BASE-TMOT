@@ -6,7 +6,7 @@ def load_motchallenge(fname, **kwargs):
     min_confidence = kwargs.pop('min_confidence', -1)
     df = pd.read_csv(
         fname,
-        sep=sep,
+        sep=',',
         index_col=[0, 1],
         skipinitialspace=True,
         header=None,

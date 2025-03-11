@@ -4,9 +4,9 @@ import sys, os
 
 import torchvision
 
-from utils import estimate_W
+from utils import estimate_W, Hist1D, Hist2D
 from sht_tracker import SHTTracker
-from bbox import BBoxEstimator
+from bbox import BBoxEstimator, LastDetectionUpdater, LastDetetectionAllocator, LastDetectionIniter
 from confidence import ConfidenceEstimator
 from collections import namedtuple, deque
 
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath('./build'))
 import torch
 
 TrackData = namedtuple('TrackData',
-                       'all_valid_tracks all_ids ids llrs new_tracks tlwhs detected confidences label')
+                       'all_valid_tracks all_ids ids llrs new_tracks tlwhs tlwh_dets detected confidences label')
 
 
 class Detection(object):
@@ -62,6 +62,13 @@ class Detection(object):
         scale_h, scale_w = self.get_scale_for_img_size(img_size)
         return (self.x1 + self.x2) / 2 * scale_w, (self.y1 + self.y2) / 2 * scale_h, (self.x2 - self.x1) * scale_w, (
                 self.y2 - self.y1) * scale_h
+
+
+def preprocess_detections(detections, detections_size):
+    if isinstance(detections, torch.Tensor):
+        return detections
+    return torch.cat([torch.tensor([det.to_ccwh(detections_size) for det in detections]),
+                      torch.tensor([det.score for det in detections])[:, None]], 1)
 
 
 def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45):
@@ -121,10 +128,12 @@ class CameraDetectorState:
         if not valid_tracks.any() or self.compares.shape[1] == 0:
             return torch.zeros(self.compares.shape[0], dtype=self.compares.dtype, device=self.compares.device)
 
-        p = self.compares.exp()
+        lr = self.compares.exp()
+        p = lr / (lr + 1)
         ptilde = p / (self.cd + p.sum(dim=0) + 1e-14)
 
-        np_res = (1 - ptilde).log().sum(dim=1)
+        np_res = (torch.clip(1 - ptilde, 1e-8, 1 - 1e-8)).log().sum(dim=1)
+        # np_res = (1 - ptilde).log().sum(dim=1)
         llr = (1 - np_res.exp()).log() - np_res
         llr = self.l_adjust(self.pd, llr)
 
@@ -157,6 +166,8 @@ class BufferedLookaheadTracker:
             return False
         h, w = in_size_hw
         frame_id, track_data, detections = self.result_buf.popleft()
+        if len(track_data) == 0:
+            return False, *[None] * 5
         all_valid_tracks = track_data.all_valid_tracks
         all_ids = track_data.all_ids
         killed = ~all_valid_tracks
@@ -168,6 +179,8 @@ class BufferedLookaheadTracker:
         has_more_detections[:] = False
 
         for _, next_tracks, detections_ in self.result_buf:
+            if len(next_tracks) == 0:
+                continue
             all_ids_ = next_tracks.all_ids
             all_valid_tracks_ = next_tracks.all_valid_tracks
             killed |= ~(all_valid_tracks_ & (all_ids_ == all_ids))
@@ -183,14 +196,17 @@ class BufferedLookaheadTracker:
         if not self.params['report_undetected']:
             valid_tracks &= track_data.detected[all_valid_tracks] | track_data.new_tracks[all_valid_tracks]
         tlwh_scale = torch.tensor((w, h), dtype=llrs.dtype, device=llrs.device).repeat(2)
-        track_tlwhs = track_data.tlwhs[valid_tracks] * tlwh_scale
+        if 'report_detections' in self.params and self.params['report_detections']:
+            track_tlwhs = track_data.tlwh_dets[valid_tracks]
+        else:
+            track_tlwhs = track_data.tlwhs[valid_tracks]
+        track_tlwhs *= tlwh_scale
         intersect_area, track_area = intersection_over_track(track_tlwhs,
                                                              torch.tensor([0, 0, w, h], dtype=track_tlwhs.dtype,
                                                                           device=track_tlwhs.device)[None])
         inside_frame = intersect_area[:, 0] > 0
         valid_tracks[valid_tracks.clone()] &= inside_frame
 
-        track_tlwhs = track_data.tlwhs[valid_tracks] * tlwh_scale
         track_ids = (track_data.ids[valid_tracks] + 1).cpu().numpy()
         track_confidences = track_data.confidences[valid_tracks].cpu().numpy()
         track_labels = np.full(track_confidences.shape, track_data.label, dtype=np.int32)
@@ -201,6 +217,7 @@ class BufferedLookaheadTracker:
             subtract_wh += np.maximum((track_tlwhs[:, :2] + track_tlwhs[:, 2:]) - img_size - 1, 0)
             track_tlwhs[:, 2:] = track_tlwhs[:, 2:] - subtract_wh
             track_tlwhs[:, :2] = np.minimum(track_tlwhs[:, :2], img_size)
+
         return frame_id, track_confidences, track_data.llrs[
             valid_tracks], track_ids, track_labels, track_tlwhs.cpu().numpy()
 
@@ -217,31 +234,41 @@ class DynamicSigmaAndClutterDensityTracker:
         self.tracker.reset()
 
     def track(self, frame_id, detections, detection_size, in_size_hw, update_s) -> TrackData:
-        assert self.seq_vo is not None, "You need to set seq_vo before calling track"
+        # assert self.seq_vo is not None, "You need to set seq_vo before calling track"
+        detections = preprocess_detections(detections, detection_size)
         params = self.params
         h, w = in_size_hw
         R = self.params['R']
         tracker = self.tracker
-        meas_scale = np.array((detection_size[1] / w, detection_size[0] / h))
-        J = torch.tensor(np.diag(np.sqrt(meas_scale).repeat(2)))
-        seq_R = J @ R @ J
-        box_sizes = np.array([det.to_tlwh(detection_size)[-2] for det in detections])
+        img_scale = torch.tensor((detection_size[1] / w, detection_size[0] / h))
+        # wh = torch.tensor([det.to_tlwh()[-2:] for det in detections]).reshape(-1, 2)
+        wh = detections[:, 2:4]
+        meas_scale = wh / torch.tensor([10, 20], dtype=R.dtype)[None]
+        meas_scale = meas_scale.repeat(1, 2)
+        img_scale = img_scale.repeat((1, 2))
+        J = torch.diag_embed(torch.sqrt(meas_scale * img_scale))
+        seq_R = (J @ R @ J).to(self.tracker.dtype)
+        box_sizes = detections[:, 2]
         if self.first:
             cd_fac = params['cd_fac0']
             self.first = False
         else:
             cd_fac = params['cd_fac']
-        clutter_density = self.estimate_clutter_density(torch.tensor(box_sizes), cd_fac, self.params['boxsize_hist'],
+        clutter_density = self.estimate_clutter_density(box_sizes, cd_fac, self.params['boxsize_hist'],
                                                         self.params['scale_power'], detection_size, h, w)
-        W, sigma_W = estimate_W(frame_id, self.seq_vo, detection_size, in_size_hw)
-        return tracker.track(detections, seq_R + np.diag(np.array((sigma_W, sigma_W, 0, 0)) ** 2),
+        if self.seq_vo is None:
+            W, sigma_W = torch.eye(3), 0
+        else:
+            W, sigma_W = estimate_W(frame_id, self.seq_vo, detection_size, in_size_hw)
+        return tracker.track(detections,
+                             seq_R + torch.diag(torch.tensor((sigma_W, sigma_W, 0, 0), dtype=seq_R.dtype) ** 2),
                              clutter_density, detection_size, W=W, update_s=update_s)
 
     @staticmethod
     def estimate_clutter_density(box_sizes, cd_fac0, cdfac_hist, scale_power, detection_size, h, w):
         clutter_density = np.prod(np.array((h, w)) / detection_size) ** scale_power * cd_fac0 * cdfac_hist(
             box_sizes) / np.prod(detection_size)
-        return clutter_density
+        return torch.clamp_min(clutter_density, 1e-14)
 
     def reset(self, seq_vo=None, **kwargs):
         if seq_vo is not None:
@@ -267,9 +294,11 @@ def intersection_over_track(track_tlwh, det_tlwh):
 class MOTTracker:
 
     def __init__(self, parameters=None, detection_size=(1080, 1920), num_classes=1,
+                 preprocess=True,
                  **extra_parameters):
         super()
         self.num_classes = num_classes
+        self.preprocess = preprocess
 
         if parameters is None:
             parameters = {}
@@ -299,13 +328,16 @@ class MOTTracker:
             'score',
             parameters['inlier_odds_hist']
         )
+        last_detection_updater = LastDetectionUpdater('last_detection', 'bbox', self.confidence_estimator.comparator)
         self.tracker = SHTTracker(
             params=self.parameters,
             allocators=[
                 self.bbox_estimator.allocator,
+                LastDetetectionAllocator('last_detection', self.dtype, self.device)
             ],
             initers=[
                 self.bbox_estimator.initer,
+                LastDetectionIniter('last_detection', meas_id='bbox'),
                 self.confidence_estimator.initer
             ],
             predictors=[
@@ -317,6 +349,7 @@ class MOTTracker:
             ],
             updaters=[
                 self.bbox_estimator.updater,
+                last_detection_updater
             ],
             validators=[
                 self.bbox_estimator.validator
@@ -329,18 +362,25 @@ class MOTTracker:
         self.full_W = torch.eye(3, dtype=self.dtype, device=self.device)
 
     def track(self, detections, R, cd, img_shape=(480, 640), update_s=0.0333333333, W=None):
-        R, cd, classification, score, z = self.preprocess_detections(R, cd, detections)
+        if not isinstance(detections, torch.Tensor):
+            detections = preprocess_detections(detections, self.detection_size)
+        detections = detections.to(self.dtype)
+        if detections.shape[1] == 5:
+            z, score = detections[:, :4], detections[:, 4]
+            classification = torch.zeros_like(score)
+        else:
+            z, score, classification = detections[:, :4], detections[:, 4], detections[:, 5]
 
-        self.full_W = torch.tensor(W, dtype=self.dtype, device=self.device) @ self.full_W
-        self.W_buf.append(torch.tensor(W, dtype=self.dtype, device=self.device))
+        self.full_W = W  # torch.tensor(W, dtype=self.dtype, device=self.device) @ self.full_W
+        self.W_buf.append(W)  # torch.tensor(W, dtype=self.dtype, device=self.device))
 
         if len(self.W_buf) > 10:
             self.full_W = self.full_W @ self.W_buf.popleft().inverse()
 
         self.tracker.predict(
             {
-                'dt': update_s,
-                'W': torch.tensor(W, dtype=self.dtype, device=self.device)
+                'dt': update_s * 3 + 0.025,
+                'W': W  # torch.tensor(W, dtype=self.dtype, device=self.device)
             }
         )
         self.tracker.validate()
@@ -350,7 +390,8 @@ class MOTTracker:
             'cd': cd,
             'bbox': (z, R),
             'class': classification,
-            'score': score
+            'score': score,
+            'pd': self.parameters['pd']
         }
 
         self.tracker.observe(
@@ -364,15 +405,16 @@ class MOTTracker:
         associated_tracks, compares, new_tracks = self.tracker.update(
             detections_sht
         )
+        self.tracker.reorganize_tracks()
 
         x, P = self.tracker.data['bbox_motion']
 
-        unassociated_tracks = self.tracker.valid_tracks.clone()
-        unassociated_tracks[associated_tracks] = False
-        unassociated_tlwh = x[unassociated_tracks]
-        unassociated_tlwh[:, :2] -= unassociated_tlwh[:, 2:4] / 2
-        det_tlwh = z  # OVERWRITTEN!
-        det_tlwh[:, :2] -= det_tlwh[:, 2:] / 2
+        # unassociated_tracks = self.tracker.valid_tracks.clone()
+        # unassociated_tracks[associated_tracks] = False
+        # unassociated_tlwh = x[unassociated_tracks]
+        # unassociated_tlwh[:, :2] -= unassociated_tlwh[:, 2:4] / 2
+        # det_tlwh = z  # OVERWRITTEN!
+        # det_tlwh[:, :2] -= det_tlwh[:, 2:] / 2
 
         self.tracker.llrs[self.tracker.all_valid_tracks] = self.tracker.llrs[self.tracker.all_valid_tracks].clamp(
             max=self.parameters['max_llr'], min=self.parameters['min_llr'])
@@ -404,6 +446,15 @@ class MOTTracker:
         tlwh_scale = 1 / torch.tensor(img_shape[::-1], dtype=cc.dtype, device=cc.device).repeat(2)
         detected = torch.zeros(self.tracker.all_valid_tracks.shape, dtype=torch.bool, device=cc.device)
         detected[self.associated_tracks] = True
+
+        det_bbox = self.tracker.data['last_detection'][0][valid_tracks].clone()
+        det_conf = self.tracker.data['last_detection'][1][valid_tracks].clone()
+        cc_det = det_bbox[:, :2]
+        if 'track_top' in self.parameters and self.parameters['track_top']:
+            cc_det[:, 1] += det_bbox[:, 3] / 2
+        wh_det = det_bbox[:, 2:4]
+        detected[self.associated_tracks] = True
+
         return TrackData(
             all_valid_tracks=self.tracker.all_valid_tracks.detach().clone(),
             all_ids=self.tracker.track_ids.detach().clone(),
@@ -411,6 +462,7 @@ class MOTTracker:
             llrs=self.tracker.llrs[valid_tracks].detach().clone(),
             new_tracks=new_tracks,
             tlwhs=(torch.cat((cc - wh / 2, wh), 1) * tlwh_scale[None]).detach().clone(),
+            tlwh_dets=(torch.cat((cc_det - wh_det / 2, wh_det), 1) * tlwh_scale[None]).detach().clone(),
             detected=detected,
             confidences=1 / (1 + (-self.tracker.llrs[valid_tracks]).exp()),
             label=label
@@ -423,10 +475,11 @@ class MOTTracker:
         self.tracker.reset()
 
 
-def create_tracker(best_dict, detection_size, run_buffer=True):
+def create_tracker(best_dict, detection_size, run_buffer=True, preprocess=True):
     tracker = MOTTracker(
         parameters=best_dict,
-        detection_size=detection_size
+        detection_size=detection_size,
+        preprocess=preprocess
     )
     tracker = DynamicSigmaAndClutterDensityTracker(
         tracker=tracker,
@@ -438,12 +491,14 @@ def create_tracker(best_dict, detection_size, run_buffer=True):
 
 
 def get_parameters(prefix=''):
-    estimated_params = torch.load(f'./data/{prefix}estimated_params.pt')
+    estimated_params = torch.load(f'./data/{prefix}estimated_params.pt', weights_only=False)
     manual_params = json.load(open(f'./data/{prefix}manual_params.json', 'r'))
 
     params = dict(
-        boxsize_hist=torch.load(f'./data/{prefix}boxsize_hist.pt'),
-        inlier_odds_hist=torch.load(f'./data/{prefix}inlier_odds_hist.pt'),
+        boxsize_hist=Hist1D(*torch.load(f'./data/{prefix}boxsize_hist.pt', weights_only=True)),
+        # boxsize_hist=Hist1D(*torch.load('/home/sigmund/dev/Paper-base-visapp-2024/data/tmot_boxsize_hist.pt', weights_only=True)),
+        # inlier_odds_hist=Hist2D(*torch.load(f'/home/sigmund/dev/Paper-base-visapp-2024/data/tmot_inlier_odds_hist.pt'))
+        inlier_odds_hist=Hist2D(*torch.load(f'./data/{prefix}inlier_odds_hist.pt', weights_only=True)),
     )
     params.update(estimated_params)
     params.update(manual_params)

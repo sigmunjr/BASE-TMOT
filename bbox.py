@@ -3,6 +3,47 @@ import math
 import torch
 
 
+class LastDetetectionAllocator:
+    def __init__(self, state_id, dtype, device):
+        self.state_id = state_id
+        self.dtype = dtype
+        self.device = device
+
+    def __call__(self, num_tracks):
+        x = torch.empty((num_tracks, 4), dtype=self.dtype, device=self.device)
+        c = torch.empty((num_tracks,), dtype=self.dtype, device=self.device)
+        return self.state_id, (x, c)
+
+
+class LastDetectionIniter:
+    def __init__(self, state_id, meas_id):
+        self.state_id = state_id
+        self.meas_id = meas_id
+
+    def __call__(self, data, llrs, detections, new_tracks, new_detections):
+        x, c = data[self.state_id]
+        z, R = detections[self.meas_id]
+
+        x[new_tracks] = z[new_detections]
+        c[new_tracks] = 1.0
+
+
+class LastDetectionUpdater:
+    def __init__(self, state_id, meas_id, confidence_comparator):
+        self.state_id = state_id
+        self.confidence_comparator = confidence_comparator
+        self.meas_id = meas_id
+
+    def __call__(self, data, detections, associated_tracks, associated_measurements, **kwargs):
+        if len(associated_tracks) == 0:
+            return
+
+        p = self.confidence_comparator(data, detections, associated_tracks)
+        x, c = data[self.state_id]
+        z, R = detections[self.meas_id]
+        x[associated_tracks] = z[associated_measurements].clone()
+
+
 class BBoxAllocator:
     def __init__(self, state_id, dtype, device):
         self.state_id = state_id
@@ -149,7 +190,13 @@ class BBoxComparator:
         log_det_S = 2 * torch.log(L.diagonal(dim1=-2, dim2=-1)).sum(dim=-1)
 
         llr = -0.5 * 4 * math.log(2 * math.pi) - 0.5 * mah_dist2 - 0.5 * log_det_S
-        return llr
+        p = torch.exp(llr) * detections['pd']#[:, None]
+        p = p / (p.sum(dim=0) + detections['cd'])
+        # llr = torch.log(p) - (1 - p).log()
+        # assert not llr.isnan().any(), "got nan in llr"
+
+        return torch.log(p) - torch.log(1 - p)  # , torch.tensor(-6))
+        # return llr
 
 
 class BBoxUpdater:
@@ -166,6 +213,10 @@ class BBoxUpdater:
         x = data[self.state_id][0]
         P = data[self.state_id][1]
         z, R = detections[self.meas_id]
+        size_diff = torch.sqrt((x[associated_tracks, 2:4] - z[associated_measurements, 2:4]).abs() / 2)  # /2
+        r_scale = torch.cat([0.5 + size_diff, 0.5 * torch.ones((size_diff.shape[0], 2))], dim=-1)
+        J = torch.diag_embed(r_scale)
+        R[associated_measurements] = J @ R[associated_measurements] @ J
 
         x[associated_tracks], P[associated_tracks] = kalman.update(x[associated_tracks], P[associated_tracks],
                                                                    z[associated_measurements],

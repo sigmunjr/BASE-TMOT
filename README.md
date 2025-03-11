@@ -16,6 +16,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Run TP-MOT from folder
+This will run the thermal model on image files in a folder e.g. tmot_dataset/images/val and save results to ./data/tmot_base
+
+```bash
+python tmot_base.py <data path>/tmot_dataset/images/val
+```
+
 ## Estimate parameters from training set (optional)
 ```bash
 python estimate_params.py

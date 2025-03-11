@@ -2,6 +2,9 @@ from lapjv import lapjv
 import math
 import torch
 
+def p_to_log(p):
+    llrs = torch.log(p) - torch.log(1 - p)
+    return llrs
 
 class SHTTracker:
     '''
@@ -59,15 +62,29 @@ class SHTTracker:
         num_detections = detections['num']
 
         compares = self._compare(detections, self.all_valid_tracks)
-        cd = detections['cd']
+        lr = compares.exp()
+        compares = lr / (1 + lr)
+        # compares = p / (detections['cd'] + (1-detections['pd']) + p.sum(dim=0))
 
-        unused_detections = torch.ones(num_detections, dtype=torch.bool, device=self.device)
+        # compares = ptilde.log() - (1 - ptilde).log()
+        num_tracks = compares.shape[0]
+        undetected_prob = torch.diag(1 - torch.tensor(detections['pd'])[None].repeat(num_tracks))
+        compares = torch.cat([compares, undetected_prob], dim=1)
+
+        cd = torch.zeros((compares.shape[1],), dtype=self.dtype, device=self.device)
+        cd[:num_detections] = detections['cd']
+        # cd = detections['cd']
+
+        unused_detections = torch.ones(compares.shape[1], dtype=torch.bool, device=self.device)
         valid_compares = compares[self.valid_tracks[self.all_valid_tracks]]
         associated_tracks, associated_detections = self._associate(valid_compares, cd, self.valid_tracks, unused_detections)
-        self._update(detections, associated_tracks, associated_detections)
 
         if len(associated_detections) > 0:
+            true_det = associated_detections < num_detections
+            associated_detections = associated_detections[true_det]
+            associated_tracks = associated_tracks[true_det]
             unused_detections[associated_detections] = False
+        self._update(detections, associated_tracks, associated_detections)
 
         if len(unused_detections) > 0 and self.valid_candidate_tracks.any():
             candidate_compares = compares[self.valid_candidate_tracks[self.all_valid_tracks]]
@@ -75,22 +92,27 @@ class SHTTracker:
             associated_candidates, cand_associated_detections = self._associate(candidate_compares, cd[unused_detections],
                                                                            self.valid_candidate_tracks,
                                                                            unused_detections)
-            self._update(detections, associated_candidates, cand_associated_detections)
 
             if len(cand_associated_detections) > 0:
-                associated_tracks = torch.cat((associated_tracks, associated_candidates), dim=0)
+                true_det = cand_associated_detections < num_detections
+                cand_associated_detections = cand_associated_detections[true_det]
+                associated_candidates = associated_candidates[true_det]
                 unused_detections[cand_associated_detections] = False
+            self._update(detections, associated_candidates, cand_associated_detections)
+            associated_tracks = torch.cat((associated_tracks, associated_candidates), dim=0)
 
+        unused_detections = unused_detections[:num_detections]
         new_tracks = torch.zeros(self.valid_tracks.shape, dtype=torch.bool, device=self.device)
         if len(unused_detections) > 0:
             new_tracks = self._init(detections, unused_detections)
 
-        compares = self._compare(detections, self.all_valid_tracks)
+        # compares = self._compare(detections, self.all_valid_tracks)
         return associated_tracks, compares, new_tracks
 
     def observe(self, detector_state):
         self.llrs[self.all_valid_tracks] += detector_state(self.data, self.all_valid_tracks)
 
+    def reorganize_tracks(self):
         self._kill_bad_tracks()
         self._kill_bad_candidate_tracks()
         self._promote_good_candidate_tracks()
@@ -115,7 +137,7 @@ class SHTTracker:
         num_tracks, num_detections = llrs.shape
         n = max(num_tracks, num_detections)
         costs = torch.empty((n, n), dtype=llrs.dtype, device=llrs.device)
-        max_cost = 1e6
+        max_cost = 0
 
         if num_tracks < n:
             costs[num_tracks:, :] = max_cost
@@ -123,12 +145,12 @@ class SHTTracker:
         if num_detections < n:
             costs[:, num_detections:] = max_cost
 
-        p = llrs.exp()
-        ptilde = p / (cd + p.sum(dim=0) + 1e-14)
-
-        llrs = ptilde.log() - (1 - ptilde).log()
+        # p = llrs.exp()
+        # ptilde = p / (cd + p.sum(dim=0) + 1e-14)
+        #
+        # llrs = ptilde.log() - (1 - ptilde).log()
         costs[:num_tracks, :num_detections] = -llrs
-        llr_gate = math.log(self.params['gate']) - math.log(1 - self.params['gate'])
+        llr_gate = self.params['gate']# .log(self.params['gate']) - math.log(1 - self.params['gate'])
 
         costs[:num_tracks, :num_detections][llrs < llr_gate] = max_cost
         row_ind, _, _ = lapjv(costs.cpu().numpy())

@@ -18,12 +18,14 @@ det_filename_to_size = dict(
 
 
 class FrameIterator:
-    def __init__(self, path, detections_filename='det', gt_path='gt/gt.txt', seq_split=None):
+    def __init__(self, path, detections_filename='det', gt_path='gt/gt.txt', seq_split=None, im_dir=None):
         self._groundtruth_frame = None
         self._detections = {}
         self._detections_frame = None
         self.path = path
         self._info = None
+        self.im_dir = im_dir
+        self._img_files = None
         self.iter_index = 0
         self.detections_filename = detections_filename
         self.valid_indices = self.get_valid_indices(seq_split)
@@ -65,6 +67,19 @@ class FrameIterator:
                                     track['Y'] + track['Height'], img_size=(h, w), id=j,
                                     visibility=track['Visibility']))
         return tracks
+
+    @property
+    def img_files(self):
+        if self._img_files is not None:
+            return self._img_files
+        im_dir = self.im_dir if self.im_dir is not None else self.info['imDir']
+        img_files = np.array(
+            sorted(glob.glob(os.path.join(self.path, im_dir, '*' + self.info['imExt'])))
+        )
+        if self.valid_indices is not None:
+            img_files = img_files[self.valid_indices - 1]
+        self._img_files = img_files
+        return self._img_files
 
     @property
     def groundtruth_frame(self):
