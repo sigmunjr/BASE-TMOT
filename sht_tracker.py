@@ -137,7 +137,7 @@ class SHTTracker:
         num_tracks, num_detections = llrs.shape
         n = max(num_tracks, num_detections)
         costs = torch.empty((n, n), dtype=llrs.dtype, device=llrs.device)
-        max_cost = 0
+        max_cost = 1e6
 
         if num_tracks < n:
             costs[num_tracks:, :] = max_cost
@@ -150,7 +150,7 @@ class SHTTracker:
         #
         # llrs = ptilde.log() - (1 - ptilde).log()
         costs[:num_tracks, :num_detections] = -llrs
-        llr_gate = self.params['gate']# .log(self.params['gate']) - math.log(1 - self.params['gate'])
+        llr_gate = math.log(self.params['gate']) - math.log(1 - self.params['gate'])
 
         costs[:num_tracks, :num_detections][llrs < llr_gate] = max_cost
         row_ind, _, _ = lapjv(costs.cpu().numpy())

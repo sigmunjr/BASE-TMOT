@@ -118,6 +118,11 @@ class SequenceEvaluator:
                     self.raw_data['gt_confidences'].insert(i, np.array([], dtype=int))
                     gt_frame_ids.insert(i + j, t_frame_id + j)
                 gt_length = len(gt_frame_ids)
+            if i >= len(self.raw_data['gt_dets']):
+                self.raw_data['gt_dets'].append(np.array([]).reshape((0, 4)))
+                self.raw_data['gt_ids'].append(np.array([], dtype=int))
+                self.raw_data['gt_classes'].append(np.array([], dtype=int))
+                self.raw_data['gt_confidences'].append(np.array([], dtype=int))
             gt_dets = self.raw_data['gt_dets'][i]
             track_dets = self.raw_data['tracker_dets'][i]
             ious = _BaseDataset._calculate_box_ious(gt_dets, track_dets)

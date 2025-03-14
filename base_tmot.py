@@ -111,7 +111,7 @@ class YOLOv8Simplified(nn.Module):
         indices = torchvision.ops.nms(box, scores, self.iou_thresh)
         out = x[indices]
         out[:, :4] = out[:, :4] * self.detections_scale / self.img_size
-        out[:, :4] = xyxy2xywh(out[:, :4])
+        out[:, :4] = xyxy2xywh(out[:, :4] + 1)
         return out.cpu()
 
 
@@ -232,7 +232,7 @@ def run_with_live_detection_in_mot_folder(base_folder):
         Path(results_path).mkdir(parents=True, exist_ok=True)
 
     reader = SequenceReader(
-        f'{base_folder}/valval/seq*',
+        f'{base_folder}/train/seq*',
         detections_filename='det_yolov8s_1280_mtmmc',
         # im_dir='thermal',
     )
@@ -247,6 +247,9 @@ def run_with_live_detection_in_mot_folder(base_folder):
     print(parameters)
     tracker = create_tracker(parameters, detection_size, preprocess=False)
     names = []
+    full_runtimes = []
+    track_times = []
+    det_times = []
     for (seq, info) in reader:
         valid_indices = seq.valid_indices
         img_files = seq.img_files
@@ -276,8 +279,11 @@ def run_with_live_detection_in_mot_folder(base_folder):
             seq,
             start=1):
             img = cv2.imread(img_files[seq_frame_id - 1])
+            det_start = time.time()
             detections = det_model(img, is_bgr=True)
+            det_times.append(time.time() - det_start)
 
+            track_start = time.time()
             frame_id, track_confidences, track_llrs, track_ids, track_labels, track_tlwhs = tracker.track(
                 frame_id=seq_frame_id,
                 detections=detections,
@@ -285,6 +291,7 @@ def run_with_live_detection_in_mot_folder(base_folder):
                 in_size_hw=(h, w),
                 update_s=update_s
             )
+            track_times.append(time.time() - track_start)
 
             if not frame_id:
                 continue
@@ -309,6 +316,7 @@ def run_with_live_detection_in_mot_folder(base_folder):
             )
 
         end = time.time()
+        full_runtimes.append(end - begin)
         print(f'took {(end - begin) * 1e3:.2f}ms')
 
         if parameters['interpolate']:
@@ -324,6 +332,9 @@ def run_with_live_detection_in_mot_folder(base_folder):
         if write_to_file:
             result_filename = os.path.join(results_path, '{}.txt'.format(name))
             write_results(result_filename, sequence_result)
+    if get_metrics:
+        print_sequence_results(sequence_results)
+    print(f'mean full runtime: {np.mean(full_runtimes)} mean det time: {np.mean(det_times)} mean track time: {np.mean(track_times)}')
     print('done')
 
 
@@ -341,7 +352,8 @@ def run_stuff(base_folder):
         detections_filename='det_yolov8s_1280_mtmmc',
     )
     sequence_results = []
-    detection_size = np.array((1080, 1920))  # tracker.detection_size
+    # detection_size = np.array((1080, 1920))  # tracker.detection_size
+    detection_size = np.array((1024, 1280))  # tracker.detection_size
     parameters = get_parameters('tmot_')
     parameters['R'] = torch.tensor([[10.9158, 0.1866, -0.1089, -0.5445],
                                     [0.1866, 10.1854, -0.5839, -0.9501],

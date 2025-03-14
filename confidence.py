@@ -1,3 +1,5 @@
+import torch
+
 
 class ConfidenceIniter:
     def __init__(self, comparator):
@@ -21,7 +23,9 @@ class ConfidenceComparator:
 
     def __call__(self, data, detections, valid_tracks):
         z = detections[self.bbox_id][0]
-        return self.eval(detections[self.conf_id], z[:, 2].contiguous())[None]
+        scores = detections[self.conf_id]
+        return torch.log(scores / (1 - scores))
+        # return self.eval(detections[self.conf_id], z[:, 2].contiguous())[None]
 
     def eval(self, scores, box_sizes):
         return self.detection_lr_hist(scores, box_sizes).log()
