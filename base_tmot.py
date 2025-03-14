@@ -220,7 +220,7 @@ def show_img_cv(show_img, track_ids, track_tlwhs):
             cv2.putText(show_img, str(id), p1, cv2.FONT_HERSHEY_PLAIN,
                         1, color, thickness=1)
     cv2.imshow("BASE", show_img)
-    cv2.waitKey(10)
+    cv2.waitKey(1)
 
 
 def run_with_live_detection_in_mot_folder(base_folder):
